@@ -1,0 +1,300 @@
+---
+# Linux worker pod: loads fake-pci on the host, creates a kind-1.35-vfio-gpu
+# cluster, installs DRA driver + KubeVirt, runs DRA e2e.
+#
+# Host prerequisites (once on the worker node):
+#   KVER=$(uname -r)
+#   dnf install -y kernel-devel-${KVER}
+#
+# Uses podman-in-container via runner.sh (same as project-infra kind jobs).
+# Podman needs fully qualified image names when there is no TTY; KIND_NODE_IMAGE
+# uses the docker.io/ prefix for kindest/node.
+#
+# Usage:
+#   kubectl apply -f linux-background-pod.yaml
+#   kubectl logs -f kubevirt-dra-e2e -n kubevirt-dra-e2e
+#
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kubevirt-dra-e2e
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kubevirt-dra-e2e
+  namespace: kubevirt-dra-e2e
+  labels:
+    app: debug
+spec:
+  restartPolicy: Never
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: type
+            operator: NotIn
+            values: [kwok]
+  # hostUsers + privileged are required for insmod from the pod into the host kernel.
+  hostUsers: true
+  containers:
+  - name: dra-e2e
+    image: quay.io/kubevirtci/bootstrap:v20260417-7427ea2
+    imagePullPolicy: IfNotPresent
+    securityContext:
+      privileged: true
+      runAsUser: 0
+      allowPrivilegeEscalation: true
+    env:
+    - name: PODMAN_IN_CONTAINER_ENABLED
+      value: "true"
+    - name: PODMAN_IN_CONTAINER_IPV6_ENABLED
+      value: "false"
+    - name: PODMAN_IGNORE_CGROUPSV1_WARNING
+      value: "true"
+    - name: GIT_REPO
+      value: https://github.com/Sreeja1725/kubevirt.git
+    - name: GIT_BRANCH
+      value: add-dra-e2e-tests
+    - name: KUBEVIRT_PROVIDER
+      value: kind-1.35-vfio-gpu
+    - name: FEATURE_GATES
+      value: GPUsWithDRA,HostDevicesWithDRA,HostDevices
+    - name: FAKE_PCI_DEVICES
+      value: "8"
+    - name: FAKE_IOMMU
+      value: "true"
+    - name: DRA_DRIVER_PROFILE
+      value: vfio-gpu
+    - name: DRA_DRIVER_NAME
+      value: vfio-gpu.example.com
+    - name: KUBEVIRT_E2E_FOCUS
+      value: '\[sig-compute\]DRA'
+    - name: WORKDIR
+      value: /workspace/kubevirt
+    - name: KIND_VERSION
+      value: "0.31.0"
+    - name: KIND_NODE_IMAGE
+      value: docker.io/kindest/node:v1.35.0@sha256:4613778f3cfcd10e615029370f5786704559103cf27bef934597ba562b269661
+    command:
+    - /usr/local/bin/runner.sh
+    - /bin/bash
+    - -ec
+    - |
+      set -euxo pipefail
+
+      install_tools() {
+        dnf install -y git make kmod pciutils sudo helm curl 2>/dev/null || true
+
+        curl -fsSL -o /usr/local/bin/kubectl \
+          "https://dl.k8s.io/release/v1.35.0/bin/linux/amd64/kubectl"
+        chmod +x /usr/local/bin/kubectl
+
+        curl -fsSL -o /usr/local/bin/kind \
+          "https://kind.sigs.k8s.io/dl/v${KIND_VERSION}/kind-linux-amd64"
+        chmod +x /usr/local/bin/kind
+
+        kubectl version --client
+        kind version
+      }
+      install_tools
+
+      ensure_inotify_limits() {
+        # kind nodes fail systemd boot with "Too many open files" when inotify
+        # limits are too low on busy workers.
+        sysctl -w fs.inotify.max_user_watches=524288 2>/dev/null || true
+        sysctl -w fs.inotify.max_user_instances=8192 2>/dev/null || true
+      }
+      ensure_inotify_limits
+
+      ensure_podman_shortnames() {
+        # Podman rejects unqualified names like "kindest/node" without a TTY.
+        mkdir -p /etc/containers/registries.conf.d
+        printf '%s\n' \
+          'unqualified-search-registries = ["docker.io", "quay.io", "registry.k8s.io"]' \
+          > /etc/containers/registries.conf.d/999-shortnames.conf
+      }
+
+      verify_cri() {
+        # runner.sh started podman and linked /var/run/docker.sock -> podman socket.
+        # kind must use the podman provider — the docker code path passes bridge
+        # options (com.docker.network.bridge.enable_ip_masquerade) that podman rejects.
+        ensure_podman_shortnames
+        export CRI_BIN=podman
+        export KIND_EXPERIMENTAL_PROVIDER=podman
+        podman version
+        podman info
+        podman run --rm docker.io/library/hello-world:latest
+        echo "Using podman-in-container (project-infra bootstrap pattern)"
+      }
+      verify_cri
+
+      prefetch_kind_node_image() {
+        local image="${KIND_NODE_IMAGE}"
+        if [[ "${image}" != */*/* ]]; then
+          image="docker.io/${image}"
+          export KIND_NODE_IMAGE="${image}"
+        fi
+        echo "Prefetching kind node image ${KIND_NODE_IMAGE}"
+        podman pull "${KIND_NODE_IMAGE}"
+      }
+
+      ensure_kernel_headers() {
+        local kver kdir src
+        kver="$(uname -r)"
+        kdir="/lib/modules/${kver}/build"
+
+        if [ -d "${kdir}" ]; then
+          echo "kernel headers OK: ${kdir}"
+          return 0
+        fi
+
+        echo "kernel headers missing at ${kdir}, trying to resolve..."
+        dnf install -y "kernel-devel-${kver}" 2>/dev/null || true
+
+        if [ ! -e "${kdir}" ]; then
+          for src in /usr/src/kernels/*; do
+            [ -d "${src}" ] || continue
+            case "$(basename "${src}")" in
+              "${kver}"*|"${kver}")
+                echo "linking ${src} -> ${kdir}"
+                ln -sfn "${src}" "${kdir}"
+                break
+                ;;
+            esac
+          done
+        fi
+
+        if [ ! -d "${kdir}" ]; then
+          echo "ERROR: no kernel headers for ${kver}" >&2
+          echo "On the worker node: dnf install -y kernel-devel-${kver}" >&2
+          ls -la /usr/src/kernels 2>/dev/null || true
+          exit 1
+        fi
+      }
+
+      uname -r
+
+      rm -rf "${WORKDIR}"
+      git clone --branch "${GIT_BRANCH}" --depth 1 "${GIT_REPO}" "${WORKDIR}"
+      cd "${WORKDIR}"
+      git submodule update --init --recursive kubevirtci
+
+      ensure_kernel_headers
+
+      VFIO_DIR="${WORKDIR}/kubevirtci/cluster-up/cluster/kind-1.35-vfio-gpu"
+      export FAKE_PCI_DEVICES FAKE_IOMMU
+      bash "${VFIO_DIR}/setup-host-vfio-pci.sh" setup
+      bash "${VFIO_DIR}/setup-fake-pci-host.sh" status
+
+      export KUBEVIRT_PROVIDER FEATURE_GATES
+      export DOCKER_PREFIX=localhost:5000/kubevirt
+
+      cleanup_kind_cluster() {
+        local name="${KUBEVIRT_PROVIDER}"
+        echo "Cleaning up stale kind cluster ${name}..."
+
+        kind delete cluster --name "${name}" 2>/dev/null || true
+
+        mapfile -t stale < <(${CRI_BIN} ps -aq \
+          --filter "label=io.x-k8s.kind.cluster=${name}" 2>/dev/null || true)
+        if ((${#stale[@]})); then
+          echo "Removing stale kind containers: ${stale[*]}"
+          ${CRI_BIN} rm -f "${stale[@]}" 2>/dev/null || true
+        fi
+
+        ${CRI_BIN} rm -f "${name}-control-plane" "${name}-registry" 2>/dev/null || true
+        ${CRI_BIN} network rm kind 2>/dev/null || true
+      }
+
+      dump_kind_diagnostics() {
+        local name="${KUBEVIRT_PROVIDER}"
+        echo "=== ${CRI_BIN} logs ${name}-control-plane (last 100 lines) ==="
+        ${CRI_BIN} logs "${name}-control-plane" 2>&1 | tail -100 || true
+        echo "=== ${CRI_BIN} inspect ${name}-control-plane (state) ==="
+        ${CRI_BIN} inspect "${name}-control-plane" --format '{{.State.Status}}' 2>/dev/null || true
+      }
+
+      cluster_up_with_retry() {
+        local attempt
+        for attempt in 1 2 3; do
+          echo "make cluster-up attempt ${attempt}/3"
+          if make cluster-up; then
+            return 0
+          fi
+          dump_kind_diagnostics
+          cleanup_kind_cluster
+          ensure_inotify_limits
+          sleep 10
+        done
+        return 1
+      }
+
+      cleanup_kind_cluster
+      prefetch_kind_node_image
+      export IPFAMILY=ipv4
+      cluster_up_with_retry
+
+      export KUBECONFIG="${WORKDIR}/kubevirtci/_ci-configs/${KUBEVIRT_PROVIDER}/.kubeconfig"
+      export PATH="${WORKDIR}/kubevirtci/_ci-configs/${KUBEVIRT_PROVIDER}:${PATH}"
+      kubectl get nodes
+
+      # DRA driver on the kind cluster (vfio sysfs is bind-mounted into kind nodes)
+      DRA_SRC=/tmp/dra-example-driver
+      rm -rf "${DRA_SRC}"
+      git clone --depth 1 --branch kubevirt-dra-profile \
+        https://github.com/Sreeja1725/dra-example-driver.git "${DRA_SRC}"
+      helm upgrade -i dra-example-driver "${DRA_SRC}/deployments/helm/dra-example-driver" \
+        --namespace dra-example-driver --create-namespace \
+        --set deviceProfile="${DRA_DRIVER_PROFILE}" \
+        --set driverName="${DRA_DRIVER_NAME}" \
+        --set kubeletPlugin.enableDeviceMetadata=true
+
+      kubectl --kubeconfig "${KUBECONFIG}" get resourceslice -A
+      kubectl --kubeconfig "${KUBECONFIG}" get resourceslice -oyaml
+      kubectl --kubeconfig "${KUBECONFIG}" get deviceclass
+
+      export KUBEVIRT_RUN_UNNESTED=true
+      export KUBEVIRT_E2E_FOCUS
+      export kubeconfig="${KUBECONFIG}"
+      make cluster-sync
+      make functest
+
+      echo "DRA e2e run finished"
+      trap 'bash "${VFIO_DIR}/setup-fake-pci-host.sh" cleanup || true' EXIT
+      exec sleep infinity
+    volumeMounts:
+    - name: workspace
+      mountPath: /workspace
+    - name: podman-data
+      mountPath: /var/lib/containers
+    - name: lib-modules
+      mountPath: /lib/modules
+    - name: usr-src
+      mountPath: /usr/src
+    - name: sys
+      mountPath: /sys
+    - name: dev
+      mountPath: /dev
+  volumes:
+  - name: workspace
+    emptyDir: {}
+  - name: podman-data
+    emptyDir: {}
+  - name: lib-modules
+    hostPath:
+      path: /lib/modules
+      type: Directory
+  - name: usr-src
+    hostPath:
+      path: /usr/src
+      type: Directory
+  - name: sys
+    hostPath:
+      path: /sys
+      type: Directory
+  - name: dev
+    hostPath:
+      path: /dev
+      type: Directory
