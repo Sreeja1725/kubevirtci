@@ -23,6 +23,29 @@ set -o pipefail
 DRA_EXAMPLE_DRIVER_REPO="https://github.com/Sreeja1725/dra-example-driver.git"
 DRA_EXAMPLE_DRIVER_BRANCH="kubevirt-dra-profile"
 DRA_EXAMPLE_DRIVER_DIR=${DRA_EXAMPLE_DRIVER_DIR:-"${KUBEVIRTCI_CONFIG_PATH}/${KUBEVIRT_PROVIDER}/_dra-example-driver"}
+DRA_DRIVER_NAMESPACE=${DRA_DRIVER_NAMESPACE:-dra-example-driver}
+
+function cluster::_kubectl() {
+    if [ -n "${KUBECTL:-}" ]; then
+        ${KUBECTL} "$@"
+    elif [ -n "${KUBECONFIG:-}" ]; then
+        kubectl --kubeconfig="${KUBECONFIG}" "$@"
+    else
+        kubectl "$@"
+    fi
+}
+
+function cluster::ensure_dra_driver_namespace() {
+    if ! cluster::_kubectl get namespace "${DRA_DRIVER_NAMESPACE}" >/dev/null 2>&1; then
+        cluster::_kubectl create namespace "${DRA_DRIVER_NAMESPACE}"
+    fi
+
+    cluster::_kubectl label namespace "${DRA_DRIVER_NAMESPACE}" \
+        pod-security.kubernetes.io/enforce=privileged \
+        pod-security.kubernetes.io/warn=privileged \
+        pod-security.kubernetes.io/audit=privileged \
+        --overwrite
+}
 
 function cluster::_get_dra_repo() {
     git --git-dir "${DRA_EXAMPLE_DRIVER_DIR}/.git" config --get remote.origin.url 2>/dev/null || true
@@ -98,9 +121,11 @@ function cluster::install_dra_example_driver() {
 
     ${CONTAINER_TOOL} push "${local_image_repo}:${driver_image_tag}"
 
+    cluster::ensure_dra_driver_namespace
+
     helm upgrade -i dra-example-driver "${DRA_EXAMPLE_DRIVER_DIR}/deployments/helm/dra-example-driver" \
         --kubeconfig "${KUBECONFIG}" \
-        --namespace dra-example-driver --create-namespace \
+        --namespace "${DRA_DRIVER_NAMESPACE}" \
         --set deviceProfile="${DRA_DRIVER_PROFILE}" \
         --set driverName="${DRA_DRIVER_NAME}" \
         --set image.repository="${manifest_image_repo}" \
