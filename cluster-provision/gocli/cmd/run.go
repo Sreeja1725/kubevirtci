@@ -50,6 +50,7 @@ import (
 	"kubevirt.io/kubevirtci/cluster-provision/gocli/opts/rookceph"
 	"kubevirt.io/kubevirtci/cluster-provision/gocli/opts/rootkey"
 	"kubevirt.io/kubevirtci/cluster-provision/gocli/opts/swap"
+	"kubevirt.io/kubevirtci/cluster-provision/gocli/opts/vsock"
 	k8s "kubevirt.io/kubevirtci/cluster-provision/gocli/pkg/k8s"
 	"kubevirt.io/kubevirtci/cluster-provision/gocli/pkg/libssh"
 
@@ -171,6 +172,7 @@ func NewRunCommand() *cobra.Command {
 	run.Flags().StringArrayVar(&usbDisks, "usb", []string{}, "size of the emulate USB disk to pass to the node")
 	run.Flags().StringArrayVar(&sharedDisks, "shared-block-device", []string{}, "size of block device to share between all nodes")
 	run.Flags().Bool("deploy-network-resources-injector", false, "deploys Network Resources Injector")
+	run.Flags().String("vsock-child-ns-mode", "", "vsock child namespace mode (global or local)")
 
 	return run
 }
@@ -442,6 +444,11 @@ func run(cmd *cobra.Command, args []string) (retErr error) {
 		return err
 	}
 
+	vsockChildNsMode, err := cmd.Flags().GetString("vsock-child-ns-mode")
+	if err != nil {
+		return err
+	}
+
 	cli, err = client.NewClientWithOpts(client.FromEnv)
 	if err != nil {
 		return err
@@ -558,15 +565,19 @@ func run(cmd *cobra.Command, args []string) (retErr error) {
 		if err != nil {
 			return err
 		}
-		// Pull the ganesha image
-		err = docker.ImagePull(cli, ctx, utils.NFSGaneshaImage, image.PullOptions{})
+		// Pull the nfs image
+		err = docker.ImagePull(cli, ctx, utils.NFSServerImage, image.PullOptions{})
 		if err != nil {
 			panic(err)
 		}
 
-		// Start the ganesha image
+		// Start the nfs container
 		nfsServer, err := cli.ContainerCreate(ctx, &container.Config{
-			Image: utils.NFSGaneshaImage,
+			Image: utils.NFSServerImage,
+			Env: []string{
+				"NFS_DIR=/data/nfs",
+				"NFS_OPTION=fsid=0,rw,sync,insecure,no_root_squash,no_subtree_check,nohide",
+			},
 		}, &container.HostConfig{
 			Mounts: []mount.Mount{
 				{
@@ -577,7 +588,7 @@ func run(cmd *cobra.Command, args []string) (retErr error) {
 			},
 			Privileged:  true,
 			NetworkMode: container.NetworkMode("container:" + dnsmasq.ID),
-		}, nil, nil, prefix+"-nfs-ganesha")
+		}, nil, nil, prefix+"-nfs")
 		if err != nil {
 			return err
 		}
@@ -601,6 +612,10 @@ func run(cmd *cobra.Command, args []string) (retErr error) {
 	qemuArgs += " -serial pty"
 
 	var qemuNetDevice = getNetDeviceByArch()
+	pcieBus := ""
+	if qemuNetDevice != QEMU_DEVICE_S390X {
+		pcieBus = ",bus=pcie.0"
+	}
 
 	wg := sync.WaitGroup{}
 	wg.Add(int(nodes))
@@ -621,7 +636,7 @@ func run(cmd *cobra.Command, args []string) (retErr error) {
 			if qemuNetDevice == QEMU_DEVICE_S390X {
 				nodeQemuMonitorArgs = fmt.Sprintf("%s netdev_add tap,id=secondarynet%s,ifname=stap%s,script=no,downscript=no; device_add %s,netdev=secondarynet%s,mac=52:55:00:d1:56:%s;", nodeQemuMonitorArgs, netSuffix, netSuffix, qemuNetDevice, netSuffix, macSuffix)
 			} else { //devices like virtio-net-pci doesn't support hot-plug
-				nodeQemuArgs = fmt.Sprintf("%s -device %s,netdev=secondarynet%s,mac=52:55:00:d1:56:%s -netdev tap,id=secondarynet%s,ifname=stap%s,script=no,downscript=no", nodeQemuArgs, qemuNetDevice, netSuffix, macSuffix, netSuffix, netSuffix)
+				nodeQemuArgs = fmt.Sprintf("%s -device %s,netdev=secondarynet%s,mac=52:55:00:d1:56:%s,bus=pcie.0 -netdev tap,id=secondarynet%s,ifname=stap%s,script=no,downscript=no", nodeQemuArgs, qemuNetDevice, netSuffix, macSuffix, netSuffix, netSuffix)
 			}
 		}
 
@@ -661,7 +676,7 @@ func run(cmd *cobra.Command, args []string) (retErr error) {
 					CgroupPermissions: "mrw",
 				},
 			}
-			nodeQemuArgs = fmt.Sprintf("%s -device vfio-pci,host=%s", nodeQemuArgs, gpuAddress)
+			nodeQemuArgs = fmt.Sprintf("%s -device vfio-pci,host=%s%s", nodeQemuArgs, gpuAddress, pcieBus)
 		}
 
 		var vmArgsNvmeDisks []string
@@ -669,13 +684,13 @@ func run(cmd *cobra.Command, args []string) (retErr error) {
 			for i, size := range nvmeDisks {
 				resource.MustParse(size)
 				disk := fmt.Sprintf("%s-%d.img", nvmeDiskImagePrefix, i)
-				nodeQemuArgs = fmt.Sprintf("%s -drive file=%s,format=raw,id=NVME%d,if=none -device nvme,drive=NVME%d,serial=nvme-%d", nodeQemuArgs, disk, i, i, i)
+				nodeQemuArgs = fmt.Sprintf("%s -drive file=%s,format=raw,id=NVME%d,if=none -device nvme,drive=NVME%d,serial=nvme-%d%s", nodeQemuArgs, disk, i, i, i, pcieBus)
 				vmArgsNvmeDisks = append(vmArgsNvmeDisks, fmt.Sprintf("--nvme-device-size %s", size))
 			}
 		}
 		var vmArgsSCSIDisks []string
 		if len(scsiDisks) > 0 {
-			nodeQemuArgs = fmt.Sprintf("%s -device virtio-scsi-pci,id=scsi0", nodeQemuArgs)
+			nodeQemuArgs = fmt.Sprintf("%s -device virtio-scsi-pci,id=scsi0%s", nodeQemuArgs, pcieBus)
 			for i, size := range scsiDisks {
 				resource.MustParse(size)
 				disk := fmt.Sprintf("%s-%d.img", scsiDiskImagePrefix, i)
@@ -685,7 +700,7 @@ func run(cmd *cobra.Command, args []string) (retErr error) {
 		}
 
 		var vmArgsUSBDisks []string
-		const bus = " -device qemu-xhci,id=bus%d"
+		bus := " -device qemu-xhci,id=bus%d" + pcieBus
 		const drive = " -drive if=none,id=stick%d,format=raw,file=/usb-%d.img"
 		const dev = " -device usb-storage,bus=bus%d.0,drive=stick%d"
 		const usbSizefmt = " --usb-device-size %s"
@@ -840,6 +855,7 @@ func run(cmd *cobra.Command, args []string) (retErr error) {
 			nodesconfig.WithSwapBehavior(swapBehavior),
 			nodesconfig.WithSwapSize(int(swapSize)),
 			nodesconfig.WithSecondaryNicBridges(secondaryNicBridges),
+			nodesconfig.WithVsockChildNsMode(vsockChildNsMode),
 		}
 
 		n := nodesconfig.NewNodeLinuxConfig(x+1, prefix, linuxConfigFuncs)
@@ -1051,6 +1067,14 @@ func provisionNode(sshClient libssh.Client, n *nodesconfig.NodeLinuxConfig) erro
 	if n.SwapEnabled {
 		swapOpt := swap.NewSwapOpt(sshClient, n.Swappiness, n.SwapBehavior, n.SwapSize)
 		opts = append(opts, swapOpt)
+	}
+
+	if n.VsockChildNsMode != "" {
+		vsockOpt, err := vsock.NewVsockOpt(sshClient, n.VsockChildNsMode)
+		if err != nil {
+			return err
+		}
+		opts = append(opts, vsockOpt)
 	}
 
 	for _, o := range opts {
